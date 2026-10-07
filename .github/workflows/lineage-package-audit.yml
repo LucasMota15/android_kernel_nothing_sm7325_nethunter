@@ -42,17 +42,59 @@ jobs:
             wget \
             xz-utils
 
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: stable
-          cache: false
-
-      - name: Install payload-dumper-go
+      - name: Install pinned payload-dumper-go binary
         run: |
-          go install github.com/ssut/payload-dumper-go@latest
+          PDG_VERSION="2.1.0"
+          PDG_ASSET="payload-dumper-go_${PDG_VERSION}_linux_amd64.tar.gz"
+          PDG_URL="https://github.com/ssut/payload-dumper-go/releases/download/${PDG_VERSION}/${PDG_ASSET}"
+          PDG_SHA256="bbbb53a71955c69272afdef7bc7e83a1bb1770f453d0c21dcaf61a3ba0463c11"
 
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "Downloading payload-dumper-go ${PDG_VERSION}..."
+
+          wget \
+            --progress=dot:giga \
+            "$PDG_URL" \
+            -O "/tmp/${PDG_ASSET}"
+
+          echo
+          echo "Verifying official release checksum..."
+
+          echo "${PDG_SHA256}  /tmp/${PDG_ASSET}" \
+            | sha256sum -c -
+
+          rm -rf /tmp/payload-dumper-go
+          mkdir -p /tmp/payload-dumper-go
+
+          tar \
+            -xzf "/tmp/${PDG_ASSET}" \
+            -C /tmp/payload-dumper-go
+
+          PDG_BIN="$(
+            find /tmp/payload-dumper-go \
+              -type f \
+              -name 'payload-dumper-go' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$PDG_BIN" ]; then
+            echo "::error::payload-dumper-go binary was not found inside the official release archive"
+            find /tmp/payload-dumper-go -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          sudo install \
+            -m 0755 \
+            "$PDG_BIN" \
+            /usr/local/bin/payload-dumper-go
+
+          echo
+          echo "Installed binary:"
+          command -v payload-dumper-go
+
+          echo
+          echo "payload-dumper-go help:"
+          payload-dumper-go --help | head -n 30
 
       - name: Download pinned official LineageOS build
         run: |
