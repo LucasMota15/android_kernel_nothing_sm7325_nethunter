@@ -125,7 +125,7 @@ jobs:
           echo "Kernel: $(cat out/include/config/kernel.release)"
           echo "In-tree modules: $(find out -type f -name '*.ko' | wc -l)"
 
-      - name: Clone aircrack-ng RTL8812AU driver
+      - name: Clone and prepare aircrack-ng RTL8812AU driver
         run: |
           git clone \
             --depth 1 \
@@ -134,6 +134,18 @@ jobs:
             external-rtl8812au
 
           git -C external-rtl8812au rev-parse HEAD
+
+          echo "Removing Clang-incompatible GCC warning flag..."
+          sed -i '/EXTRA_CFLAGS += -Wno-stringop-overread/d' \
+            external-rtl8812au/Makefile
+
+          echo "Verifying patch..."
+          if grep -n -- '-Wno-stringop-overread' external-rtl8812au/Makefile; then
+            echo "::error::-Wno-stringop-overread is still present in the driver Makefile"
+            exit 1
+          fi
+
+          echo "::notice::RTL8812AU Makefile prepared for AOSP Clang"
 
       - name: Build RTL88XXAU module
         run: |
