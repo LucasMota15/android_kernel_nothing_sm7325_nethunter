@@ -1,0 +1,292 @@
+name: NetHunter Kernel Gate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kernel-gate:
+    name: NetHunter configs + Image + in-tree modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache
+          df -h
+
+      - name: Checkout kernel
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            rsync \
+            wget \
+            xz-utils \
+            zip
+
+      - name: Cache AOSP Clang
+        uses: actions/cache@v5
+        with:
+          path: /tmp/aosp-clang/clang-r547379
+          key: aosp-clang-r547379-v1
+
+      - name: Download AOSP Clang
+        run: |
+          mkdir -p /tmp/aosp-clang
+
+          if [ ! -d /tmp/aosp-clang/clang-r547379/bin ]; then
+            cd /tmp/aosp-clang
+
+            wget -q \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/clang-r547379.tar.gz" \
+              -O clang.tar.gz
+
+            mkdir -p clang-r547379
+            tar -xf clang.tar.gz -C clang-r547379
+            rm clang.tar.gz
+          fi
+
+          /tmp/aosp-clang/clang-r547379/bin/clang --version | head -1
+
+      - name: Configure baseline
+        run: |
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          mkdir -p out
+
+          make O=out vendor/lahaina-qgki_defconfig
+
+      - name: Enable NetHunter USB and NFS configs
+        run: |
+          ./scripts/config --file out/.config \
+            -e USB_ACM \
+            -e USB_GADGET \
+            -e USB_CONFIGFS \
+            -e USB_CONFIGFS_SERIAL \
+            -e USB_CONFIGFS_ACM \
+            -e USB_CONFIGFS_OBEX \
+            -e USB_CONFIGFS_NCM \
+            -e USB_CONFIGFS_ECM \
+            -e USB_CONFIGFS_ECM_SUBSET \
+            -e USB_CONFIGFS_RNDIS \
+            -e USB_CONFIGFS_EEM \
+            -e USB_CONFIGFS_MASS_STORAGE \
+            -e USB_CONFIGFS_F_HID \
+            -e NETWORK_FILESYSTEMS \
+            -e NFS_FS \
+            -e NFS_V2 \
+            -e NFS_V3 \
+            -e NFS_V4 \
+            -e NFSD \
+            -e NFSD_V3 \
+            -e NFSD_V4
+
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          make O=out olddefconfig
+
+      - name: Verify required NetHunter configs
+        run: |
+          set -e
+
+          REQUIRED_CONFIGS=(
+            CONFIG_USB_ACM
+            CONFIG_USB_GADGET
+            CONFIG_USB_CONFIGFS
+            CONFIG_USB_CONFIGFS_SERIAL
+            CONFIG_USB_CONFIGFS_ACM
+            CONFIG_USB_CONFIGFS_OBEX
+            CONFIG_USB_CONFIGFS_NCM
+            CONFIG_USB_CONFIGFS_ECM
+            CONFIG_USB_CONFIGFS_ECM_SUBSET
+            CONFIG_USB_CONFIGFS_RNDIS
+            CONFIG_USB_CONFIGFS_EEM
+            CONFIG_USB_CONFIGFS_MASS_STORAGE
+            CONFIG_USB_CONFIGFS_F_HID
+            CONFIG_NETWORK_FILESYSTEMS
+            CONFIG_NFS_FS
+            CONFIG_NFS_V2
+            CONFIG_NFS_V3
+            CONFIG_NFS_V4
+            CONFIG_NFSD
+            CONFIG_NFSD_V3
+            CONFIG_NFSD_V4
+          )
+
+          FAILED=0
+
+          echo "=== NetHunter required configs ==="
+
+          for CFG in "${REQUIRED_CONFIGS[@]}"; do
+            if grep -Eq "^${CFG}=(y|m)$" out/.config; then
+              grep -E "^${CFG}=" out/.config
+            else
+              echo "MISSING: ${CFG}"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more required NetHunter configs were rejected by olddefconfig"
+            exit 1
+          fi
+
+          echo "::notice::All requested USB/NFS NetHunter configs survived olddefconfig"
+
+      - name: Audit NetHunter and QCACLD-related source
+        run: |
+          mkdir -p artifacts
+
+          {
+            echo "=== Kernel source audit ==="
+            echo
+            echo "Repository:"
+            git remote -v
+            echo
+            echo "Commit:"
+            git rev-parse HEAD
+            echo
+            echo "Branch:"
+            git branch --show-current
+            echo
+            echo "=== QCACLD / monitor / injection references ==="
+            git grep -n -I -E \
+              'qcacld|QCA_CLD|FULL_MON|WLAN_FEATURE_FULL_MON|frame.?inject|monitor.?mode' \
+              | head -n 500 || true
+          } | tee artifacts/source-audit.txt
+
+      - name: Build Image and in-tree modules
+        run: |
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          make O=out -j$(nproc) Image modules
+
+          test -f out/arch/arm64/boot/Image
+
+          echo "::notice::Image + in-tree modules compiled successfully"
+
+      - name: Audit generated modules
+        run: |
+          mkdir -p artifacts
+
+          find out -type f -name '*.ko' | sort \
+            | tee artifacts/module-paths.txt
+
+          MODULE_COUNT=$(wc -l < artifacts/module-paths.txt)
+
+          echo "In-tree modules generated: ${MODULE_COUNT}"
+
+          if grep -q 'qca_cld3_qca6750\.ko' artifacts/module-paths.txt; then
+            echo "QCACLD_RESULT=BUILT" | tee artifacts/qcacld-result.txt
+            echo "::notice::qca_cld3_qca6750.ko was produced by the kernel build"
+          else
+            echo "QCACLD_RESULT=NOT_BUILT_BY_KERNEL_TREE" \
+              | tee artifacts/qcacld-result.txt
+
+            echo "::warning::qca_cld3_qca6750.ko was NOT produced by this kernel-tree build. It requires separate handling."
+          fi
+
+      - name: Collect kernel artifacts
+        run: |
+          mkdir -p artifacts/kernel
+
+          cp out/arch/arm64/boot/Image \
+             artifacts/kernel/Image
+
+          cp out/.config \
+             artifacts/kernel/config.txt
+
+          cp out/include/config/kernel.release \
+             artifacts/kernel/kernel.release
+
+          if [ -f out/Module.symvers ]; then
+            cp out/Module.symvers \
+               artifacts/kernel/Module.symvers
+          fi
+
+          if [ -f out/System.map ]; then
+            cp out/System.map \
+               artifacts/kernel/System.map
+          fi
+
+          find out -type f -name '*.ko' -print0 \
+            | tar --null -czf artifacts/in-tree-modules.tar.gz --files-from=-
+
+          find artifacts \
+            -type f \
+            ! -name checksums.sha256 \
+            -exec sha256sum {} \; \
+            > artifacts/checksums.sha256
+
+          echo "=== Artifact contents ==="
+          du -h artifacts/*
+          cat artifacts/checksums.sha256
+
+      - name: Build summary
+        run: |
+          {
+            echo "# NetHunter Kernel Gate"
+            echo
+            echo "**Kernel:** $(cat out/include/config/kernel.release)"
+            echo
+            echo "**Image:** ✅"
+            echo
+            echo "**NetHunter USB configs:** ✅"
+            echo
+            echo "**NFS configs:** ✅"
+            echo
+            echo "**In-tree modules:** $(find out -type f -name '*.ko' | wc -l)"
+            echo
+            echo "**QCACLD:** $(cat artifacts/qcacld-result.txt)"
+            echo
+            echo "No phone flashing was performed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: spacewar-nethunter-kernel-gate
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
