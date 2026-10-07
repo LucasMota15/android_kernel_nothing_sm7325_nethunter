@@ -1,0 +1,448 @@
+name: Lineage 23.2 Package Audit
+
+on:
+  workflow_dispatch:
+
+env:
+  LINEAGE_DATE: "20261007"
+  OTA_NAME: "lineage-23.2-20261007-nightly-Spacewar-signed.zip"
+  OTA_URL: "https://ftp.fau.de/lineageos/full/Spacewar/20261007/lineage-23.2-20261007-nightly-Spacewar-signed.zip"
+
+jobs:
+  audit:
+    name: Audit official Lineage boot + vendor_boot + vendor_dlkm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache
+
+          df -h
+
+      - name: Install audit dependencies
+        run: |
+          sudo apt-get update -qq
+
+          sudo apt-get install -y --no-install-recommends \
+            cpio \
+            curl \
+            erofs-utils \
+            file \
+            git \
+            kmod \
+            lz4 \
+            python3 \
+            unzip \
+            wget \
+            xz-utils
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install payload-dumper-go
+        run: |
+          go install github.com/ssut/payload-dumper-go@latest
+
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Download pinned official LineageOS build
+        run: |
+          echo "Downloading:"
+          echo "$OTA_URL"
+
+          wget \
+            --progress=dot:giga \
+            "$OTA_URL" \
+            -O "$OTA_NAME"
+
+          test -s "$OTA_NAME"
+
+          echo
+          echo "Downloaded OTA:"
+          ls -lh "$OTA_NAME"
+
+          sha256sum "$OTA_NAME" \
+            | tee lineage-ota.sha256
+
+          df -h
+
+      - name: Extract required partitions from OTA
+        run: |
+          mkdir -p extracted
+
+          payload-dumper-go \
+            -o extracted \
+            -p boot,vendor_boot,vendor_dlkm,vbmeta \
+            "$OTA_NAME"
+
+          echo
+          echo "=== Extracted partitions ==="
+
+          ls -lh extracted/
+
+          test -s extracted/boot.img
+          test -s extracted/vendor_boot.img
+          test -s extracted/vendor_dlkm.img
+          test -s extracted/vbmeta.img
+
+          rm -f "$OTA_NAME"
+
+          df -h
+
+      - name: Download AOSP image inspection tools
+        run: |
+          git clone \
+            --depth 1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg \
+            aosp-mkbootimg
+
+          git clone \
+            --depth 1 \
+            https://android.googlesource.com/platform/external/avb \
+            aosp-avb
+
+      - name: Inspect boot image
+        run: |
+          mkdir -p \
+            artifacts \
+            boot-unpacked
+
+          python3 aosp-mkbootimg/unpack_bootimg.py \
+            --boot_img extracted/boot.img \
+            --out boot-unpacked \
+            --format=info \
+            | tee artifacts/boot-info.txt
+
+          echo
+          echo "=== Boot contents ==="
+
+          find boot-unpacked \
+            -maxdepth 2 \
+            -type f \
+            -printf '%P  %s bytes\n' \
+            | sort \
+            | tee artifacts/boot-files.txt
+
+          echo
+          echo "=== Kernel file ==="
+
+          file boot-unpacked/kernel \
+            | tee artifacts/stock-kernel-file.txt
+
+          echo
+          echo "=== Linux version ==="
+
+          strings boot-unpacked/kernel \
+            | grep -a -m1 '^Linux version ' \
+            | tee artifacts/stock-kernel-version.txt \
+            || true
+
+      - name: Inspect vendor_boot image
+        run: |
+          mkdir -p vendor-boot-unpacked
+
+          python3 aosp-mkbootimg/unpack_bootimg.py \
+            --boot_img extracted/vendor_boot.img \
+            --out vendor-boot-unpacked \
+            --format=info \
+            | tee artifacts/vendor-boot-info.txt
+
+          echo
+          echo "=== vendor_boot files ==="
+
+          find vendor-boot-unpacked \
+            -maxdepth 2 \
+            -type f \
+            -printf '%P  %s bytes\n' \
+            | sort \
+            | tee artifacts/vendor-boot-files.txt
+
+          RAMDISK="vendor-boot-unpacked/vendor_ramdisk"
+
+          if [ ! -f "$RAMDISK" ]; then
+            echo "::error::vendor_ramdisk was not extracted from vendor_boot"
+            exit 1
+          fi
+
+          echo
+          echo "=== Vendor ramdisk format ==="
+
+          file "$RAMDISK" \
+            | tee artifacts/vendor-ramdisk-format.txt
+
+          FORMAT="$(file -b "$RAMDISK")"
+
+          if echo "$FORMAT" | grep -qi 'LZ4'; then
+            echo "Detected LZ4 vendor ramdisk"
+
+            lz4 \
+              -d \
+              -f \
+              "$RAMDISK" \
+              vendor_ramdisk.cpio
+
+          elif echo "$FORMAT" | grep -qi 'gzip'; then
+            echo "Detected gzip vendor ramdisk"
+
+            gzip \
+              -dc \
+              "$RAMDISK" \
+              > vendor_ramdisk.cpio
+
+          elif echo "$FORMAT" | grep -qi 'cpio'; then
+            echo "Detected uncompressed cpio vendor ramdisk"
+
+            cp \
+              "$RAMDISK" \
+              vendor_ramdisk.cpio
+
+          else
+            echo "::error::Unknown vendor ramdisk compression:"
+            echo "$FORMAT"
+            exit 1
+          fi
+
+          mkdir -p vendor-ramdisk-root
+
+          (
+            cd vendor-ramdisk-root
+
+            cpio \
+              -idm \
+              --quiet \
+              --no-absolute-filenames \
+              < ../vendor_ramdisk.cpio
+          )
+
+          echo
+          echo "=== Modules inside vendor_boot ramdisk ==="
+
+          find vendor-ramdisk-root \
+            -type f \
+            -name '*.ko' \
+            -printf '%P\n' \
+            | sort \
+            | tee artifacts/vendor-boot-modules.txt
+
+          echo
+          echo "Vendor boot module count:"
+
+          wc -l artifacts/vendor-boot-modules.txt \
+            | tee artifacts/vendor-boot-module-count.txt
+
+      - name: Inspect vendor_dlkm EROFS image
+        run: |
+          sudo mkdir -p /mnt/spacewar-vendor-dlkm
+
+          echo "=== vendor_dlkm filesystem ==="
+
+          file extracted/vendor_dlkm.img \
+            | tee artifacts/vendor-dlkm-file.txt
+
+          fsck.erofs extracted/vendor_dlkm.img \
+            | tee artifacts/vendor-dlkm-fsck.txt
+
+          sudo mount \
+            -o loop,ro \
+            extracted/vendor_dlkm.img \
+            /mnt/spacewar-vendor-dlkm
+
+          echo
+          echo "=== vendor_dlkm root ==="
+
+          find /mnt/spacewar-vendor-dlkm \
+            -maxdepth 3 \
+            -printf '%P\n' \
+            | sort \
+            | tee artifacts/vendor-dlkm-tree.txt
+
+          MODULE_DIR="/mnt/spacewar-vendor-dlkm/lib/modules"
+
+          if [ ! -d "$MODULE_DIR" ]; then
+            echo "::error::vendor_dlkm/lib/modules was not found"
+            sudo umount /mnt/spacewar-vendor-dlkm
+            exit 1
+          fi
+
+          echo
+          echo "=== vendor_dlkm kernel modules ==="
+
+          find "$MODULE_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.ko' \
+            -printf '%f\n' \
+            | sort \
+            | tee artifacts/vendor-dlkm-modules.txt
+
+          echo
+          echo "=== Module count ==="
+
+          wc -l artifacts/vendor-dlkm-modules.txt \
+            | tee artifacts/vendor-dlkm-module-count.txt
+
+          if [ -f "$MODULE_DIR/modules.load" ]; then
+            sudo cp \
+              "$MODULE_DIR/modules.load" \
+              artifacts/vendor-dlkm-modules.load
+          fi
+
+          if [ -f "$MODULE_DIR/modules.dep" ]; then
+            sudo cp \
+              "$MODULE_DIR/modules.dep" \
+              artifacts/vendor-dlkm-modules.dep
+          fi
+
+          if [ -f "$MODULE_DIR/modules.alias" ]; then
+            sudo cp \
+              "$MODULE_DIR/modules.alias" \
+              artifacts/vendor-dlkm-modules.alias
+          fi
+
+          if [ -f "$MODULE_DIR/modules.softdep" ]; then
+            sudo cp \
+              "$MODULE_DIR/modules.softdep" \
+              artifacts/vendor-dlkm-modules.softdep
+          fi
+
+          QCA_MODULE="$MODULE_DIR/qca_cld3_qca6750.ko"
+
+          if [ ! -f "$QCA_MODULE" ]; then
+            echo "::error::Official qca_cld3_qca6750.ko was not found"
+            sudo umount /mnt/spacewar-vendor-dlkm
+            exit 1
+          fi
+
+          echo
+          echo "=== Stock QCACLD modinfo ==="
+
+          modinfo "$QCA_MODULE" \
+            | tee artifacts/stock-qcacld.modinfo.txt
+
+          modinfo \
+            -F vermagic \
+            "$QCA_MODULE" \
+            | tee artifacts/stock-qcacld.vermagic.txt
+
+          sudo umount /mnt/spacewar-vendor-dlkm
+
+      - name: Compare installed module list with Spacewar device tree
+        run: |
+          curl \
+            -fsSL \
+            "https://raw.githubusercontent.com/LineageOS/android_device_nothing_Spacewar/lineage-23.2/modules.load" \
+            -o artifacts/device-tree-modules.load
+
+          echo "=== Device tree module count ==="
+
+          wc -l artifacts/device-tree-modules.load
+
+          echo
+          echo "=== vendor_dlkm module count ==="
+
+          wc -l artifacts/vendor-dlkm-modules.txt
+
+          echo
+          echo "=== Comparing module names ==="
+
+          sort artifacts/device-tree-modules.load \
+            > /tmp/device-modules.sorted
+
+          sort artifacts/vendor-dlkm-modules.txt \
+            > /tmp/image-modules.sorted
+
+          diff \
+            -u \
+            /tmp/device-modules.sorted \
+            /tmp/image-modules.sorted \
+            | tee artifacts/module-list-diff.txt \
+            || true
+
+      - name: Inspect AVB metadata
+        run: |
+          for IMAGE in \
+            boot \
+            vendor_boot \
+            vendor_dlkm \
+            vbmeta
+          do
+            echo "=== AVB: ${IMAGE}.img ==="
+
+            python3 aosp-avb/avbtool.py \
+              info_image \
+              --image "extracted/${IMAGE}.img" \
+              > "artifacts/${IMAGE}-avb.txt" \
+              2>&1 \
+              || true
+
+            cat "artifacts/${IMAGE}-avb.txt"
+
+            echo
+          done
+
+      - name: Hash official base images
+        run: |
+          {
+            sha256sum extracted/boot.img
+            sha256sum extracted/vendor_boot.img
+            sha256sum extracted/vendor_dlkm.img
+            sha256sum extracted/vbmeta.img
+          } | tee artifacts/official-images.sha256
+
+          cp lineage-ota.sha256 \
+            artifacts/
+
+      - name: Build audit summary
+        run: |
+          DLKM_COUNT="$(wc -l < artifacts/vendor-dlkm-modules.txt | tr -d ' ')"
+          VENDOR_BOOT_COUNT="$(wc -l < artifacts/vendor-boot-modules.txt | tr -d ' ')"
+
+          STOCK_VERMAGIC="$(cat artifacts/stock-qcacld.vermagic.txt 2>/dev/null || true)"
+          STOCK_KERNEL="$(cat artifacts/stock-kernel-version.txt 2>/dev/null || true)"
+
+          if [ -s artifacts/module-list-diff.txt ]; then
+            MODULE_MATCH="❌ DIFFERENCES FOUND"
+          else
+            MODULE_MATCH="✅ exact match"
+          fi
+
+          {
+            echo "# Spacewar Lineage 23.2 Packaging Audit"
+            echo
+            echo "**Pinned build:** ${OTA_NAME}"
+            echo
+            echo "**vendor_dlkm modules:** ${DLKM_COUNT}"
+            echo
+            echo "**vendor_boot ramdisk modules:** ${VENDOR_BOOT_COUNT}"
+            echo
+            echo "**Device-tree module list:** ${MODULE_MATCH}"
+            echo
+            echo "**Stock QCACLD vermagic:** \`${STOCK_VERMAGIC}\`"
+            echo
+            echo "## Stock kernel"
+            echo
+            echo '```text'
+            echo "${STOCK_KERNEL}"
+            echo '```'
+            echo
+            echo "No kernel was compiled."
+            echo
+            echo "No phone was flashed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v7
+        with:
+          name: spacewar-lineage-23.2-package-audit
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
