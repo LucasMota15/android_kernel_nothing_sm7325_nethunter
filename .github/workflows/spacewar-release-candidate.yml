@@ -1,0 +1,1144 @@
+name: Spacewar NetHunter Release Candidate
+
+on:
+  workflow_dispatch:
+
+env:
+  LINEAGE_DATE: "20261007"
+  LINEAGE_NAME: "lineage-23.2-20261007-nightly-Spacewar-signed.zip"
+  LINEAGE_URL: "https://ftp.fau.de/lineageos/full/Spacewar/20261007/lineage-23.2-20261007-nightly-Spacewar-signed.zip"
+  LINEAGE_SHA256: "140f98803709eb64033ff40ef137b91727dfe52171cbe39de3cecf2f0c2892f9"
+
+  PDG_VERSION: "2.1.0"
+  PDG_SHA256: "bbbb53a71955c69272afdef7bc7e83a1bb1770f453d0c21dcaf61a3ba0463c11"
+
+  BOOT_PARTITION_SIZE: "100663296"
+  VENDOR_BOOT_PARTITION_SIZE: "100663296"
+
+  BOOT_AVB_SALT: "45c757d264ce5a9aac0190d27fb36784553f8212f3a8d05a93ea37bad716573c"
+  VENDOR_BOOT_AVB_SALT: "006bb485871bdb854728557c5a71db351e371ca463789ed72124f4d0b11360cb"
+
+jobs:
+  release-candidate:
+    name: Build and validate Spacewar NetHunter images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache
+
+          df -h
+
+      - name: Checkout NetHunter kernel
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+
+          sudo apt-get install -y --no-install-recommends \
+            attr \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            erofs-utils \
+            file \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lz4 \
+            python3 \
+            rsync \
+            wget \
+            xz-utils \
+            zip
+
+      - name: Cache AOSP Clang
+        uses: actions/cache@v5
+        with:
+          path: /tmp/aosp-clang/clang-r547379
+          key: aosp-clang-r547379-v1
+
+      - name: Download AOSP Clang
+        run: |
+          mkdir -p /tmp/aosp-clang
+
+          if [ ! -d /tmp/aosp-clang/clang-r547379/bin ]; then
+            cd /tmp/aosp-clang
+
+            wget -q \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/clang-r547379.tar.gz" \
+              -O clang.tar.gz
+
+            mkdir -p clang-r547379
+
+            tar \
+              -xf clang.tar.gz \
+              -C clang-r547379
+
+            rm clang.tar.gz
+          fi
+
+          /tmp/aosp-clang/clang-r547379/bin/clang --version | head -1
+          /tmp/aosp-clang/clang-r547379/bin/llvm-strip --version | head -1
+
+      - name: Configure final NetHunter kernel
+        run: |
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          mkdir -p out
+
+          make O=out vendor/lahaina-qgki_defconfig
+
+          ./scripts/config --file out/.config \
+            -e USB_ACM \
+            -e USB_GADGET \
+            -e USB_CONFIGFS \
+            -e USB_CONFIGFS_SERIAL \
+            -e USB_CONFIGFS_ACM \
+            -e USB_CONFIGFS_OBEX \
+            -e USB_CONFIGFS_NCM \
+            -e USB_CONFIGFS_ECM \
+            -e USB_CONFIGFS_ECM_SUBSET \
+            -e USB_CONFIGFS_RNDIS \
+            -e USB_CONFIGFS_EEM \
+            -e USB_CONFIGFS_MASS_STORAGE \
+            -e USB_CONFIGFS_F_HID \
+            -e NETWORK_FILESYSTEMS \
+            -e NFS_FS \
+            -e NFS_V2 \
+            -e NFS_V3 \
+            -e NFS_V4 \
+            -e NFSD \
+            -e NFSD_V3 \
+            -e NFSD_V4
+
+          make O=out olddefconfig
+
+      - name: Verify required NetHunter configs
+        run: |
+          set -e
+
+          REQUIRED_CONFIGS=(
+            CONFIG_USB_ACM
+            CONFIG_USB_GADGET
+            CONFIG_USB_CONFIGFS
+            CONFIG_USB_CONFIGFS_SERIAL
+            CONFIG_USB_CONFIGFS_ACM
+            CONFIG_USB_CONFIGFS_OBEX
+            CONFIG_USB_CONFIGFS_NCM
+            CONFIG_USB_CONFIGFS_ECM
+            CONFIG_USB_CONFIGFS_ECM_SUBSET
+            CONFIG_USB_CONFIGFS_RNDIS
+            CONFIG_USB_CONFIGFS_EEM
+            CONFIG_USB_CONFIGFS_MASS_STORAGE
+            CONFIG_USB_CONFIGFS_F_HID
+            CONFIG_NETWORK_FILESYSTEMS
+            CONFIG_NFS_FS
+            CONFIG_NFS_V2
+            CONFIG_NFS_V3
+            CONFIG_NFS_V4
+            CONFIG_NFSD
+            CONFIG_NFSD_V3
+            CONFIG_NFSD_V4
+          )
+
+          FAILED=0
+
+          for CFG in "${REQUIRED_CONFIGS[@]}"; do
+            if grep -Eq "^${CFG}=(y|m)$" out/.config; then
+              grep -E "^${CFG}=" out/.config
+            else
+              echo "MISSING: ${CFG}"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Required NetHunter configuration missing"
+            exit 1
+          fi
+
+      - name: Build final Image and modules
+        run: |
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          make O=out -j$(nproc) Image modules
+
+          test -f out/arch/arm64/boot/Image
+          test -f out/Module.symvers
+
+          echo "Kernel release:"
+          cat out/include/config/kernel.release
+
+          echo
+          echo "Generated modules:"
+          find out -type f -name '*.ko' | wc -l
+
+      - name: Prepare stripped Lineage-compatible module set
+        run: |
+          set -e
+
+          export PATH=/tmp/aosp-clang/clang-r547379/bin:$PATH
+
+          rm -rf custom-modules
+          mkdir -p custom-modules
+
+          while IFS= read -r MODULE; do
+            NAME="$(basename "$MODULE")"
+
+            if [ "$NAME" = "wlan.ko" ]; then
+              NAME="qca_cld3_qca6750.ko"
+            fi
+
+            llvm-strip \
+              --strip-debug \
+              -o "custom-modules/$NAME" \
+              "$MODULE"
+
+          done < <(
+            find out \
+              -type f \
+              -name '*.ko' \
+              | sort
+          )
+
+          MODULE_COUNT="$(
+            find custom-modules \
+              -maxdepth 1 \
+              -type f \
+              -name '*.ko' \
+              | wc -l
+          )"
+
+          echo "Stripped modules: $MODULE_COUNT"
+
+          if [ "$MODULE_COUNT" -ne 79 ]; then
+            echo "::error::Expected 79 modules, got $MODULE_COUNT"
+            exit 1
+          fi
+
+          test -f custom-modules/qca_cld3_qca6750.ko
+
+          echo
+          echo "QCACLD after strip:"
+          ls -lh custom-modules/qca_cld3_qca6750.ko
+          modinfo custom-modules/qca_cld3_qca6750.ko
+
+      - name: Verify module list against Lineage device tree
+        run: |
+          set -e
+
+          curl \
+            -fsSL \
+            "https://raw.githubusercontent.com/LineageOS/android_device_nothing_Spacewar/lineage-23.2/modules.load" \
+            -o expected-modules.load
+
+          curl \
+            -fsSL \
+            "https://raw.githubusercontent.com/LineageOS/android_device_nothing_Spacewar/lineage-23.2/modules.load.recovery" \
+            -o recovery-modules.load
+
+          find custom-modules \
+            -maxdepth 1 \
+            -type f \
+            -name '*.ko' \
+            -printf '%f\n' \
+            | sort \
+            > custom-modules.sorted
+
+          sort expected-modules.load \
+            > expected-modules.sorted
+
+          echo "=== Comparing complete module set ==="
+
+          diff \
+            -u \
+            expected-modules.sorted \
+            custom-modules.sorted
+
+          echo "::notice::Custom module set exactly matches Lineage Spacewar"
+
+          echo
+          echo "=== Recovery/vendor_boot modules ==="
+
+          cat recovery-modules.load
+
+          while IFS= read -r MODULE; do
+            [ -z "$MODULE" ] && continue
+
+            if [ ! -f "custom-modules/$MODULE" ]; then
+              echo "::error::Recovery module missing: $MODULE"
+              exit 1
+            fi
+          done < recovery-modules.load
+
+      - name: Verify vermagic of all custom modules
+        run: |
+          set -e
+
+          KERNEL_RELEASE="$(
+            cat out/include/config/kernel.release
+          )"
+
+          FAILED=0
+
+          for MODULE in custom-modules/*.ko; do
+            VERMAGIC="$(
+              modinfo -F vermagic "$MODULE"
+            )"
+
+            if [[ "$VERMAGIC" != "$KERNEL_RELEASE"* ]]; then
+              echo "BAD VERMAGIC: $MODULE"
+              echo "  expected: $KERNEL_RELEASE"
+              echo "  actual:   $VERMAGIC"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more modules have incompatible vermagic"
+            exit 1
+          fi
+
+          echo "::notice::All 79 modules match the final kernel release"
+
+      - name: Generate dependency metadata for comparison
+        run: |
+          set -e
+
+          rm -rf depmod-root
+
+          mkdir -p \
+            depmod-root/lib/modules/0.0
+
+          cp \
+            custom-modules/*.ko \
+            depmod-root/lib/modules/0.0/
+
+          depmod \
+            -b depmod-root \
+            0.0 \
+            || true
+
+          test -f depmod-root/lib/modules/0.0/modules.dep
+          test -f depmod-root/lib/modules/0.0/modules.alias
+          test -f depmod-root/lib/modules/0.0/modules.softdep
+
+      - name: Install pinned payload-dumper-go
+        run: |
+          PDG_ASSET="payload-dumper-go_${PDG_VERSION}_linux_amd64.tar.gz"
+
+          PDG_URL="https://github.com/ssut/payload-dumper-go/releases/download/${PDG_VERSION}/${PDG_ASSET}"
+
+          wget \
+            --progress=dot:giga \
+            "$PDG_URL" \
+            -O "/tmp/${PDG_ASSET}"
+
+          echo "${PDG_SHA256}  /tmp/${PDG_ASSET}" \
+            | sha256sum -c -
+
+          rm -rf /tmp/payload-dumper-go
+          mkdir -p /tmp/payload-dumper-go
+
+          tar \
+            -xzf "/tmp/${PDG_ASSET}" \
+            -C /tmp/payload-dumper-go
+
+          PDG_BIN="$(
+            find /tmp/payload-dumper-go \
+              -type f \
+              -name payload-dumper-go \
+              -print \
+              -quit
+          )"
+
+          test -n "$PDG_BIN"
+
+          sudo install \
+            -m 0755 \
+            "$PDG_BIN" \
+            /usr/local/bin/payload-dumper-go
+
+          payload-dumper-go --help | head -n 10
+
+      - name: Download pinned LineageOS base
+        run: |
+          wget \
+            --progress=dot:giga \
+            "$LINEAGE_URL" \
+            -O "$LINEAGE_NAME"
+
+          echo "${LINEAGE_SHA256}  ${LINEAGE_NAME}" \
+            | sha256sum -c -
+
+          ls -lh "$LINEAGE_NAME"
+
+      - name: Extract official base partitions
+        run: |
+          mkdir -p stock-images
+
+          payload-dumper-go \
+            -o stock-images \
+            -p boot,vendor_boot,vendor_dlkm,vbmeta \
+            "$LINEAGE_NAME"
+
+          test -s stock-images/boot.img
+          test -s stock-images/vendor_boot.img
+          test -s stock-images/vendor_dlkm.img
+          test -s stock-images/vbmeta.img
+
+          rm -f "$LINEAGE_NAME"
+
+          ls -lh stock-images/
+
+          df -h
+
+      - name: Download AOSP boot and AVB tools
+        run: |
+          git clone \
+            --depth 1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg \
+            aosp-mkbootimg
+
+          git clone \
+            --depth 1 \
+            https://android.googlesource.com/platform/external/avb \
+            aosp-avb
+
+      - name: Verify Lineage vbmeta configuration
+        run: |
+          python3 aosp-avb/avbtool.py \
+            info_image \
+            --image stock-images/vbmeta.img \
+            | tee stock-vbmeta-info.txt
+
+          if ! grep -Eq 'Flags:[[:space:]]+3' stock-vbmeta-info.txt; then
+            echo "::error::Pinned Lineage vbmeta no longer has Flags 3"
+            exit 1
+          fi
+
+          echo "::notice::Pinned Lineage vbmeta has verification/hashtree disabled"
+
+      - name: Build custom boot image
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf stock-boot build-images
+
+          mkdir -p \
+            stock-boot \
+            build-images
+
+          mapfile \
+            -d '' \
+            -t BOOT_ARGS \
+            < <(
+              python3 aosp-mkbootimg/unpack_bootimg.py \
+                --boot_img stock-images/boot.img \
+                --out stock-boot \
+                --format mkbootimg \
+                --null
+            )
+
+          FOUND_KERNEL=0
+
+          for ((I=0; I<${#BOOT_ARGS[@]}; I++)); do
+            if [ "${BOOT_ARGS[$I]}" = "--kernel" ]; then
+              BOOT_ARGS[$((I+1))]="$GITHUB_WORKSPACE/out/arch/arm64/boot/Image"
+              FOUND_KERNEL=1
+              break
+            fi
+          done
+
+          if [ "$FOUND_KERNEL" -ne 1 ]; then
+            echo "::error::Could not locate --kernel in mkbootimg arguments"
+            exit 1
+          fi
+
+          python3 aosp-mkbootimg/mkbootimg.py \
+            "${BOOT_ARGS[@]}" \
+            --output build-images/boot-nethunter.raw.img
+
+          cp \
+            build-images/boot-nethunter.raw.img \
+            build-images/boot-nethunter.img
+
+          python3 aosp-avb/avbtool.py \
+            add_hash_footer \
+            --image build-images/boot-nethunter.img \
+            --partition_name boot \
+            --partition_size "$BOOT_PARTITION_SIZE" \
+            --hash_algorithm sha256 \
+            --salt "$BOOT_AVB_SALT" \
+            --algorithm NONE
+
+          ls -lh \
+            build-images/boot-nethunter.raw.img \
+            build-images/boot-nethunter.img
+
+      - name: Patch vendor_boot ramdisk modules
+        run: |
+          set -e
+
+          rm -rf \
+            stock-vendor-boot \
+            vendor-ramdisk-root \
+            vendor-ramdisk.cpio \
+            vendor-ramdisk-new.cpio \
+            vendor-ramdisk-new.lz4
+
+          mkdir -p stock-vendor-boot
+
+          python3 aosp-mkbootimg/unpack_bootimg.py \
+            --boot_img stock-images/vendor_boot.img \
+            --out stock-vendor-boot \
+            --format info
+
+          file stock-vendor-boot/vendor_ramdisk
+
+          lz4 \
+            -d \
+            -f \
+            stock-vendor-boot/vendor_ramdisk \
+            vendor-ramdisk.cpio
+
+          mkdir -p vendor-ramdisk-root
+
+          sudo bash -c '
+            cd vendor-ramdisk-root
+            cpio \
+              -idm \
+              --quiet \
+              --no-absolute-filenames \
+              < ../vendor-ramdisk.cpio
+          '
+
+          echo "=== Existing vendor_boot modules ==="
+
+          find vendor-ramdisk-root \
+            -type f \
+            -name '*.ko' \
+            -printf '%P\n' \
+            | sort
+
+          while IFS= read -r MODULE; do
+            [ -z "$MODULE" ] && continue
+
+            SOURCE="custom-modules/$MODULE"
+            TARGET="vendor-ramdisk-root/lib/modules/$MODULE"
+
+            test -f "$SOURCE"
+            test -f "$TARGET"
+
+            sudo tee \
+              "$TARGET" \
+              < "$SOURCE" \
+              > /dev/null
+
+          done < recovery-modules.load
+
+          KERNEL_RELEASE="$(
+            cat out/include/config/kernel.release
+          )"
+
+          while IFS= read -r MODULE; do
+            [ -z "$MODULE" ] && continue
+
+            TARGET="vendor-ramdisk-root/lib/modules/$MODULE"
+
+            VERMAGIC="$(
+              modinfo -F vermagic "$TARGET"
+            )"
+
+            echo "$MODULE -> $VERMAGIC"
+
+            if [[ "$VERMAGIC" != "$KERNEL_RELEASE"* ]]; then
+              echo "::error::vendor_boot module vermagic mismatch: $MODULE"
+              exit 1
+            fi
+
+          done < recovery-modules.load
+
+          sudo bash -c '
+            cd vendor-ramdisk-root
+
+            find . \
+              -print0 \
+              | sort -z \
+              | cpio \
+                  --null \
+                  -o \
+                  -H newc \
+                  --quiet \
+              > ../vendor-ramdisk-new.cpio
+          '
+
+          sudo chown \
+            "$(id -u):$(id -g)" \
+            vendor-ramdisk-new.cpio
+
+          lz4 \
+            -l \
+            -12 \
+            --favor-decSpeed \
+            -f \
+            vendor-ramdisk-new.cpio \
+            vendor-ramdisk-new.lz4
+
+          ls -lh \
+            vendor-ramdisk.cpio \
+            vendor-ramdisk-new.cpio \
+            vendor-ramdisk-new.lz4
+
+      - name: Build custom vendor_boot image
+        shell: bash
+        run: |
+          set -e
+
+          mapfile \
+            -d '' \
+            -t VENDOR_ARGS \
+            < <(
+              python3 aosp-mkbootimg/unpack_bootimg.py \
+                --boot_img stock-images/vendor_boot.img \
+                --out stock-vendor-boot \
+                --format mkbootimg \
+                --null
+            )
+
+          FOUND_RAMDISK=0
+
+          for ((I=0; I<${#VENDOR_ARGS[@]}; I++)); do
+            if [ "${VENDOR_ARGS[$I]}" = "--vendor_ramdisk" ]; then
+              VENDOR_ARGS[$((I+1))]="$GITHUB_WORKSPACE/vendor-ramdisk-new.lz4"
+              FOUND_RAMDISK=1
+              break
+            fi
+          done
+
+          if [ "$FOUND_RAMDISK" -ne 1 ]; then
+            echo "::error::Could not locate --vendor_ramdisk in mkbootimg arguments"
+            exit 1
+          fi
+
+          python3 aosp-mkbootimg/mkbootimg.py \
+            "${VENDOR_ARGS[@]}" \
+            --vendor_boot build-images/vendor_boot-nethunter.raw.img
+
+          cp \
+            build-images/vendor_boot-nethunter.raw.img \
+            build-images/vendor_boot-nethunter.img
+
+          python3 aosp-avb/avbtool.py \
+            add_hash_footer \
+            --image build-images/vendor_boot-nethunter.img \
+            --partition_name vendor_boot \
+            --partition_size "$VENDOR_BOOT_PARTITION_SIZE" \
+            --hash_algorithm sha256 \
+            --salt "$VENDOR_BOOT_AVB_SALT" \
+            --algorithm NONE
+
+          ls -lh \
+            build-images/vendor_boot-nethunter.raw.img \
+            build-images/vendor_boot-nethunter.img
+
+      - name: Extract stock vendor_dlkm preserving metadata
+        run: |
+          set -e
+
+          sudo mkdir -p /mnt/stock-vendor-dlkm
+
+          sudo mount \
+            -o loop,ro \
+            stock-images/vendor_dlkm.img \
+            /mnt/stock-vendor-dlkm
+
+          rm -rf vendor-dlkm-root
+          mkdir -p vendor-dlkm-root
+
+          sudo rsync \
+            -aHAX \
+            --numeric-ids \
+            /mnt/stock-vendor-dlkm/ \
+            vendor-dlkm-root/
+
+          STOCK_QCA_CONTEXT="$(
+            sudo getfattr \
+              --only-values \
+              -n security.selinux \
+              /mnt/stock-vendor-dlkm/lib/modules/qca_cld3_qca6750.ko \
+              2>/dev/null \
+              || true
+          )"
+
+          printf '%s' "$STOCK_QCA_CONTEXT" \
+            > stock-qcacld-selinux.txt
+
+          sudo umount /mnt/stock-vendor-dlkm
+
+          test -f vendor-dlkm-root/lib/modules/qca_cld3_qca6750.ko
+          test -f vendor-dlkm-root/lib/modules/modules.load
+          test -f vendor-dlkm-root/lib/modules/modules.dep
+          test -f vendor-dlkm-root/lib/modules/modules.alias
+          test -f vendor-dlkm-root/lib/modules/modules.softdep
+
+      - name: Verify custom module dependency graph matches stock
+        run: |
+          set -e
+
+          sed \
+            's#/vendor_dlkm/lib/modules/##g' \
+            vendor-dlkm-root/lib/modules/modules.dep \
+            | sort \
+            > stock-modules.dep.normalized
+
+          sort \
+            depmod-root/lib/modules/0.0/modules.dep \
+            > custom-modules.dep.normalized
+
+          diff \
+            -u \
+            stock-modules.dep.normalized \
+            custom-modules.dep.normalized
+
+          sort \
+            vendor-dlkm-root/lib/modules/modules.alias \
+            > stock-modules.alias.sorted
+
+          sort \
+            depmod-root/lib/modules/0.0/modules.alias \
+            > custom-modules.alias.sorted
+
+          diff \
+            -u \
+            stock-modules.alias.sorted \
+            custom-modules.alias.sorted
+
+          sort \
+            vendor-dlkm-root/lib/modules/modules.softdep \
+            > stock-modules.softdep.sorted
+
+          sort \
+            depmod-root/lib/modules/0.0/modules.softdep \
+            > custom-modules.softdep.sorted
+
+          diff \
+            -u \
+            stock-modules.softdep.sorted \
+            custom-modules.softdep.sorted
+
+          echo "::notice::Custom modules preserve the Lineage dependency graph"
+
+      - name: Replace all vendor_dlkm modules
+        run: |
+          set -e
+
+          for SOURCE in custom-modules/*.ko; do
+            NAME="$(basename "$SOURCE")"
+            TARGET="vendor-dlkm-root/lib/modules/$NAME"
+
+            if [ ! -f "$TARGET" ]; then
+              echo "::error::vendor_dlkm target missing: $NAME"
+              exit 1
+            fi
+
+            sudo tee \
+              "$TARGET" \
+              < "$SOURCE" \
+              > /dev/null
+          done
+
+          KERNEL_RELEASE="$(
+            cat out/include/config/kernel.release
+          )"
+
+          FAILED=0
+
+          for MODULE in vendor-dlkm-root/lib/modules/*.ko; do
+            VERMAGIC="$(
+              modinfo -F vermagic "$MODULE"
+            )"
+
+            if [[ "$VERMAGIC" != "$KERNEL_RELEASE"* ]]; then
+              echo "BAD: $(basename "$MODULE") -> $VERMAGIC"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more vendor_dlkm modules do not match kernel"
+            exit 1
+          fi
+
+          echo "::notice::All vendor_dlkm modules replaced with matching build"
+
+      - name: Build new vendor_dlkm EROFS image
+        run: |
+          set -e
+
+          STOCK_DLKM_SIZE="$(
+            stat -c%s stock-images/vendor_dlkm.img
+          )"
+
+          echo "Stock vendor_dlkm image size: $STOCK_DLKM_SIZE"
+
+          sudo mkfs.erofs \
+            -zlz4hc,9 \
+            --mount-point=/vendor_dlkm \
+            build-images/vendor_dlkm-nethunter.raw.img \
+            vendor-dlkm-root
+
+          sudo chown \
+            "$(id -u):$(id -g)" \
+            build-images/vendor_dlkm-nethunter.raw.img
+
+          RAW_SIZE="$(
+            stat -c%s build-images/vendor_dlkm-nethunter.raw.img
+          )"
+
+          echo "Custom raw EROFS size: $RAW_SIZE"
+
+          if [ "$RAW_SIZE" -gt "$STOCK_DLKM_SIZE" ]; then
+            echo "::error::Custom vendor_dlkm exceeds stock partition image size"
+            exit 1
+          fi
+
+          cp \
+            build-images/vendor_dlkm-nethunter.raw.img \
+            build-images/vendor_dlkm-nethunter.img
+
+          truncate \
+            -s "$STOCK_DLKM_SIZE" \
+            build-images/vendor_dlkm-nethunter.img
+
+          fsck.erofs \
+            build-images/vendor_dlkm-nethunter.img
+
+          ls -lh \
+            build-images/vendor_dlkm-nethunter.raw.img \
+            build-images/vendor_dlkm-nethunter.img
+
+      - name: Validate final boot image
+        run: |
+          set -e
+
+          rm -rf verify-boot
+          mkdir -p verify-boot
+
+          python3 aosp-mkbootimg/unpack_bootimg.py \
+            --boot_img build-images/boot-nethunter.img \
+            --out verify-boot \
+            --format info
+
+          ORIGINAL_SHA="$(
+            sha256sum out/arch/arm64/boot/Image \
+              | awk '{print $1}'
+          )"
+
+          PACKED_SHA="$(
+            sha256sum verify-boot/kernel \
+              | awk '{print $1}'
+          )"
+
+          echo "Built Image:  $ORIGINAL_SHA"
+          echo "Packed Image: $PACKED_SHA"
+
+          if [ "$ORIGINAL_SHA" != "$PACKED_SHA" ]; then
+            echo "::error::Kernel changed during boot image packaging"
+            exit 1
+          fi
+
+          echo "::notice::Final boot image contains exact NetHunter kernel"
+
+      - name: Validate final vendor_boot image
+        run: |
+          set -e
+
+          rm -rf \
+            verify-vendor-boot \
+            verify-vendor-ramdisk
+
+          mkdir -p \
+            verify-vendor-boot \
+            verify-vendor-ramdisk
+
+          python3 aosp-mkbootimg/unpack_bootimg.py \
+            --boot_img build-images/vendor_boot-nethunter.img \
+            --out verify-vendor-boot \
+            --format info
+
+          lz4 \
+            -d \
+            -f \
+            verify-vendor-boot/vendor_ramdisk \
+            verify-vendor-ramdisk.cpio
+
+          (
+            cd verify-vendor-ramdisk
+
+            cpio \
+              -idm \
+              --quiet \
+              --no-absolute-filenames \
+              < ../verify-vendor-ramdisk.cpio
+          )
+
+          while IFS= read -r MODULE; do
+            [ -z "$MODULE" ] && continue
+
+            EXPECTED="$(
+              sha256sum "custom-modules/$MODULE" \
+                | awk '{print $1}'
+            )"
+
+            ACTUAL="$(
+              sha256sum "verify-vendor-ramdisk/lib/modules/$MODULE" \
+                | awk '{print $1}'
+            )"
+
+            echo "$MODULE"
+            echo "  expected: $EXPECTED"
+            echo "  actual:   $ACTUAL"
+
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::vendor_boot module differs: $MODULE"
+              exit 1
+            fi
+
+          done < recovery-modules.load
+
+          echo "::notice::All six vendor_boot modules validated"
+
+      - name: Validate final vendor_dlkm image
+        run: |
+          set -e
+
+          sudo mkdir -p /mnt/custom-vendor-dlkm
+
+          sudo mount \
+            -o loop,ro \
+            build-images/vendor_dlkm-nethunter.img \
+            /mnt/custom-vendor-dlkm
+
+          COUNT="$(
+            find /mnt/custom-vendor-dlkm/lib/modules \
+              -maxdepth 1 \
+              -type f \
+              -name '*.ko' \
+              | wc -l
+          )"
+
+          echo "Final vendor_dlkm modules: $COUNT"
+
+          if [ "$COUNT" -ne 79 ]; then
+            sudo umount /mnt/custom-vendor-dlkm
+            echo "::error::Expected 79 modules in final vendor_dlkm"
+            exit 1
+          fi
+
+          FAILED=0
+
+          for SOURCE in custom-modules/*.ko; do
+            NAME="$(basename "$SOURCE")"
+            TARGET="/mnt/custom-vendor-dlkm/lib/modules/$NAME"
+
+            if [ ! -f "$TARGET" ]; then
+              echo "MISSING: $NAME"
+              FAILED=1
+              continue
+            fi
+
+            EXPECTED="$(
+              sha256sum "$SOURCE" \
+                | awk '{print $1}'
+            )"
+
+            ACTUAL="$(
+              sudo sha256sum "$TARGET" \
+                | awk '{print $1}'
+            )"
+
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "HASH MISMATCH: $NAME"
+              FAILED=1
+            fi
+          done
+
+          STOCK_CONTEXT="$(
+            cat stock-qcacld-selinux.txt
+          )"
+
+          NEW_CONTEXT="$(
+            sudo getfattr \
+              --only-values \
+              -n security.selinux \
+              /mnt/custom-vendor-dlkm/lib/modules/qca_cld3_qca6750.ko \
+              2>/dev/null \
+              || true
+          )"
+
+          echo "Stock QCACLD SELinux context:  $STOCK_CONTEXT"
+          echo "Custom QCACLD SELinux context: $NEW_CONTEXT"
+
+          sudo umount /mnt/custom-vendor-dlkm
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::vendor_dlkm validation failed"
+            exit 1
+          fi
+
+          if [ -n "$STOCK_CONTEXT" ] && [ "$STOCK_CONTEXT" != "$NEW_CONTEXT" ]; then
+            echo "::error::SELinux context changed during EROFS rebuild"
+            exit 1
+          fi
+
+          echo "::notice::All 79 vendor_dlkm modules validated byte-for-byte"
+
+      - name: Prepare release artifact
+        run: |
+          set -e
+
+          mkdir -p artifacts/release
+
+          cp \
+            build-images/boot-nethunter.img \
+            artifacts/release/
+
+          cp \
+            build-images/vendor_boot-nethunter.img \
+            artifacts/release/
+
+          cp \
+            build-images/vendor_dlkm-nethunter.img \
+            artifacts/release/
+
+          cp \
+            out/.config \
+            artifacts/release/kernel.config
+
+          cp \
+            out/Module.symvers \
+            artifacts/release/Module.symvers
+
+          {
+            echo "Spacewar NetHunter Release Candidate"
+            echo
+            echo "DO NOT FLASH THIS PACKAGE YET."
+            echo "Wait for the installation procedure."
+            echo
+            echo "Device: Nothing Phone (1) / A063 / Spacewar"
+            echo "Lineage base: $LINEAGE_NAME"
+            echo "Lineage SHA256: $LINEAGE_SHA256"
+            echo "Kernel source commit: $(git rev-parse HEAD)"
+            echo "Kernel release: $(cat out/include/config/kernel.release)"
+            echo
+            echo "Images:"
+            echo "  boot-nethunter.img"
+            echo "  vendor_boot-nethunter.img"
+            echo "  vendor_dlkm-nethunter.img"
+            echo
+            echo "RTL88XXAU external module is NOT included."
+          } > artifacts/release/README-FIRST.txt
+
+          (
+            cd artifacts/release
+
+            sha256sum \
+              boot-nethunter.img \
+              vendor_boot-nethunter.img \
+              vendor_dlkm-nethunter.img \
+              kernel.config \
+              Module.symvers \
+              > checksums.sha256
+          )
+
+          (
+            cd artifacts/release
+
+            zip \
+              -9 \
+              ../Spacewar-NetHunter-RC-20261007.zip \
+              boot-nethunter.img \
+              vendor_boot-nethunter.img \
+              vendor_dlkm-nethunter.img \
+              kernel.config \
+              Module.symvers \
+              README-FIRST.txt \
+              checksums.sha256
+          )
+
+          sha256sum \
+            artifacts/Spacewar-NetHunter-RC-20261007.zip \
+            > artifacts/Spacewar-NetHunter-RC-20261007.zip.sha256
+
+          ls -lh \
+            artifacts/Spacewar-NetHunter-RC-20261007.zip \
+            artifacts/release/*
+
+      - name: Build final summary
+        run: |
+          {
+            echo "# Spacewar NetHunter Release Candidate"
+            echo
+            echo "**Lineage base:** \`${LINEAGE_NAME}\`"
+            echo
+            echo "**Kernel:** \`$(cat out/include/config/kernel.release)\`"
+            echo
+            echo "**Image:** ✅"
+            echo "**79 stripped modules:** ✅"
+            echo "**QCACLD alias:** ✅"
+            echo "**vendor_boot 6 matching modules:** ✅"
+            echo "**vendor_dlkm module set:** ✅"
+            echo "**Dependency graph:** ✅"
+            echo "**EROFS validation:** ✅"
+            echo "**boot repack validation:** ✅"
+            echo "**vendor_boot repack validation:** ✅"
+            echo "**vendor_dlkm byte validation:** ✅"
+            echo "**RTL88XXAU:** ❌ intentionally excluded"
+            echo
+            echo "## Result"
+            echo
+            echo "Release candidate images were generated and reopened successfully."
+            echo
+            echo "**DO NOT FLASH THEM YET.**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: Spacewar-NetHunter-RC-20261007
+          path: |
+            artifacts/Spacewar-NetHunter-RC-20261007.zip
+            artifacts/Spacewar-NetHunter-RC-20261007.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
